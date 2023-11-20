@@ -25,10 +25,6 @@ pub struct AndroidConfig {
 
     /// Path to the manifest
     pub manifest_path: PathBuf,
-    /// Path to the root of the Android SDK.
-    pub sdk_path: PathBuf,
-    /// Path to the root of the Android NDK.
-    pub ndk_path: PathBuf,
 
     /// List of targets to build the app for. Eg. `armv7-linux-androideabi`.
     pub build_targets: Vec<AndroidBuildTarget>,
@@ -40,9 +36,6 @@ pub struct AndroidConfig {
     pub target_sdk_version: u32,
     /// Version of android:minSdkVersion (optional). Default Value = android_version
     pub min_sdk_version: u32,
-
-    /// Version of the build tools to use
-    pub build_tools_version: String,
 
     /// Should we build in release mode?
     pub release: bool,
@@ -277,94 +270,28 @@ pub fn load(
         let config: TomlConfig = toml::from_str(&content).map_err(anyhow::Error::from)?;
         config.package.metadata.and_then(|m| m.android)
     };
-
-    // Determine the NDK path
-    let ndk_path = env::var("NDK_HOME").map_err(|_| {
-        format_err!(
-            "Please set the path to the Android NDK with the \
-             $NDK_HOME environment variable."
-        )
-    })?;
-
-    let sdk_path = {
-        let mut sdk_path = env::var("ANDROID_SDK_HOME").ok();
-
-        if sdk_path.is_none() {
-            sdk_path = env::var("ANDROID_HOME").ok();
-        }
-
-        sdk_path.ok_or_else(|| {
-            format_err!(
-                "Please set the path to the Android SDK with either the $ANDROID_SDK_HOME or \
-                 the $ANDROID_HOME environment variable."
-            )
-        })?
-    };
-
-    // Find the highest build tools.
-    let build_tools_version = {
-        let dir = fs::read_dir(Path::new(&sdk_path).join("build-tools"))
-            .map_err(|_| format_err!("Android SDK has no build-tools directory"))?;
-
-        let mut versions = Vec::new();
-        for next in dir {
-            let next = next.unwrap();
-
-            let meta = next.metadata().unwrap();
-            if !meta.is_dir() {
-                if !meta.is_file() {
-                    // It seems, symlink is here, so we should follow it
-                    let meta = next.path().metadata().unwrap();
-
-                    if !meta.is_dir() {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-
-            let file_name = next.file_name().into_string().unwrap();
-            if !file_name.chars().next().unwrap().is_digit(10) {
-                continue;
-            }
-
-            versions.push(file_name);
-        }
-
-        versions.sort_by(|a, b| b.cmp(&a));
-        versions
-            .into_iter()
-            .next()
-            .ok_or_else(|| format_err!("Unable to determine build tools version"))?
-    };
-
-    // Determine the Sdk versions (compile, target, min)
-    let android_version = manifest_content
-        .as_ref()
-        .and_then(|a| a.android_version)
-        .unwrap_or(31);
-
     // Check that the tool for the android platform is installed
-    let android_jar_path = Path::new(&sdk_path)
-        .join("platforms")
-        .join(format!("android-{}", android_version))
-        .join("android.jar");
+    let prefix = std::env::var("PREFIX").unwrap();
+    let android_jar_path = PathBuf::from(format!("{}/share/java/android.jar", prefix));
     if !android_jar_path.exists() {
         Err(format_err!(
             "'{}' does not exist",
             android_jar_path.to_string_lossy()
         ))?;
     }
+    // getprop ro.build.version.min_supported_target_sdk
+    let def_min_sdk = 17;
+    // getprop ro.build.version.sdk
+    let def_targ_sdk = 28;
 
     let target_sdk_version = manifest_content
         .as_ref()
         .and_then(|a| a.target_sdk_version)
-        .unwrap_or(android_version);
+        .unwrap_or(def_targ_sdk);
     let min_sdk_version = manifest_content
         .as_ref()
         .and_then(|a| a.min_sdk_version)
-        .unwrap_or(18);
+        .unwrap_or(def_min_sdk);
 
     let default_target_config = manifest_content
         .as_ref()
@@ -399,21 +326,16 @@ pub fn load(
         cargo_package_name: package.name().to_string(),
         cargo_package_version: package.version().to_string(),
         manifest_path: package.manifest_path().to_owned(),
-        sdk_path: Path::new(&sdk_path).to_owned(),
-        ndk_path: Path::new(&ndk_path).to_owned(),
         android_jar_path,
         target_sdk_version,
         min_sdk_version,
-        build_tools_version,
         release: false,
         build_targets: manifest_content
             .as_ref()
             .and_then(|a| a.build_targets.clone())
             .unwrap_or_else(|| {
                 vec![
-                    AndroidBuildTarget::ArmV7a,
-                    AndroidBuildTarget::Arm64V8a,
-                    AndroidBuildTarget::X86,
+                    AndroidBuildTarget::ArmV7a
                 ]
             }),
         default_target_config,

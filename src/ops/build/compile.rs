@@ -1,3 +1,4 @@
+use which::which;
 use super::tempfile::TempFile;
 use super::util;
 use crate::config::AndroidBuildTarget;
@@ -46,10 +47,11 @@ pub fn build_shared_libraries(
         let build_target_dir = root_build_dir.join(build_target.android_abi());
         fs::create_dir_all(&build_target_dir).unwrap();
 
+        // pkg install binutils-is-llvm
         // Set environment variables needed for use with the cc crate
-        std::env::set_var("CC", util::find_clang(config, build_target)?);
-        std::env::set_var("CXX", util::find_clang_cpp(config, build_target)?);
-        std::env::set_var("AR", util::find_ar(config, build_target)?);
+        // std::env::set_var("CC", util::find_clang(config, build_target)?);
+        // std::env::set_var("CXX", util::find_clang_cpp(config, build_target)?);
+        // std::env::set_var("AR", util::find_ar(config, build_target)?);
 
         // Use libc++. It is current default C++ runtime
         std::env::set_var("CXXSTDLIB", "c++");
@@ -120,7 +122,7 @@ impl Executor for SharedLibraryExecutor {
         if mode == CompileMode::Build
             && (target.kind() == &TargetKind::Bin || target.kind() == &TargetKind::ExampleBin)
         {
-            let mut new_args = cmd.get_args().to_owned();
+            let mut new_args = cmd.get_args().map(|v| v.clone()).collect::<Vec<OsString>>();
 
             let target_config = self
                 .config
@@ -243,55 +245,24 @@ impl Executor for SharedLibraryExecutor {
                 new_arg.push(end.as_ref());
                 new_arg
             }
+            // Set system root
+            new_args.push(build_arg("-Clink-arg=--sysroot=", &PathBuf::from("/system/lib")));
 
-            // Determine paths
-            let tool_root = util::llvm_toolchain_root(&self.config);
-
-            // NDK r23 renamed <ndk_llvm_triple>-ld to ld
-            let linker_path = tool_root.join("bin").join("ld");
-
-            let sysroot = tool_root.join("sysroot");
-            let version_independent_libraries_path = sysroot
-                .join("usr")
-                .join("lib")
-                .join(&self.build_target.ndk_triple());
-            let version_specific_libraries_path =
-                util::find_ndk_path(self.config.min_sdk_version, |platform| {
-                    version_independent_libraries_path.join(platform.to_string())
-                })?;
-
-            // Add linker arguments
-            // Specify linker
-            new_args.push(build_arg("-Clinker=", linker_path));
+            // Add version specific libraries directory to search path
+            
+            new_args.push(build_arg("-Clink-arg=-L", &PathBuf::from("/system/lib")));
+            let prefix = std::env::var("PREFIX").unwrap();
+            let sysroot_lib_dir = PathBuf::from(format!("{}/lib", prefix));
+            new_args.push(build_arg("-Clink-arg=-L", &sysroot_lib_dir));
 
             // Set linker flavor
             new_args.push("-Clinker-flavor=ld".into());
-
-            // Set system root
-            new_args.push(build_arg("-Clink-arg=--sysroot=", sysroot));
-
-            // Add version specific libraries directory to search path
-            new_args.push(build_arg("-Clink-arg=-L", &version_specific_libraries_path));
-
-            // Add version independent libraries directory to search path
-            new_args.push(build_arg(
-                "-Clink-arg=-L",
-                &version_independent_libraries_path,
-            ));
 
             // Add path containing libgcc.a and libunwind.a for linker to search.
             // See https://github.com/rust-lang/rust/pull/85806 for discussion on libgcc.
             // The workaround to get to NDK r23 or newer is to create a libgcc.a file with
             // the contents of 'INPUT(-lunwind)' to link in libunwind.a instead of libgcc.a
-            let libgcc_dir = build_path.join("_libgcc_");
-            fs::create_dir_all(&libgcc_dir)?;
-            let libgcc = libgcc_dir.join("libgcc.a");
-            std::fs::write(&libgcc, "INPUT(-lunwind)")?;
-            new_args.push(build_arg("-Clink-arg=-L", libgcc_dir));
-            let libunwind_dir = util::find_libunwind_dir(&self.config, self.build_target)?;
-            new_args.push(build_arg("-Clink-arg=-L", libunwind_dir));
-
-            // Strip symbols for release builds
+           // Strip symbols for release builds
             if self.nostrip == false {
                 if self.config.release {
                     new_args.push("-Clink-arg=-strip-all".into());
@@ -328,13 +299,17 @@ impl Executor for SharedLibraryExecutor {
 
             // If the target uses the C++ standard library, add the appropriate shared library
             // to the list of shared libraries to be added to the APK
-            let readelf_path = util::find_readelf(&self.config, self.build_target)?;
+              let readelf_path = match which::which("readelf") {
+            Ok(tool_path) => PathBuf::from(tool_path),
+            _ => return Err(format_err!("command not found: readelf")), 
+        };
 
             // Gets libraries search paths from compiler
-            let mut libs_search_paths = libs_search_paths_from_args(cmd.get_args());
+            let mut libs_search_paths = libs_search_paths_from_args(&cmd.get_args().map(|v| v.clone()).collect::<Vec<OsString>>());
 
             // Add path for searching version independent libraries like 'libc++_shared.so'
-            libs_search_paths.push(version_independent_libraries_path);
+            libs_search_paths.push(PathBuf::from("/system/lib"));
+            libs_search_paths.push(sysroot_lib_dir);
 
             // Add target/ARCH/PROFILE/deps directory for searching dylib/cdylib
             libs_search_paths.push(self.build_target_dir.join("deps"));
@@ -343,13 +318,9 @@ impl Executor for SharedLibraryExecutor {
             libs_search_paths.extend(dylib_path());
 
             // Find android platform shared libraries
-            let android_dylibs = list_android_dylibs(&version_specific_libraries_path)?;
 
             // The map of [library]: is_processed
-            let mut found_dylibs =
-                // Add android platform libraries as processed to avoid packaging it
-                android_dylibs.into_iter().map(|dylib| (dylib, true))
-                .collect::<HashMap<_, _>>();
+            let mut found_dylibs : HashMap<String, bool> = Default::default();
 
             // Extract all needed shared libraries from main
             for dylib in list_needed_dylibs(&readelf_path, &library_path)? {
@@ -373,6 +344,10 @@ impl Executor for SharedLibraryExecutor {
                         found_dylibs.entry(dylib).or_insert(false);
                     }
 
+                    match(dylib.as_str())
+                    {
+                    "libunwind.so" |
+                    "liblzma.so" => {
                     // Add found library
                     shared_libraries.insert(
                         target.clone(),
@@ -381,7 +356,8 @@ impl Executor for SharedLibraryExecutor {
                             path,
                             filename: dylib.clone(),
                         },
-                    );
+                    );}
+                    &_ => ()}
                 } else {
                     on_stderr_line(&format!(
                         "Warning: Shared library \"{}\" not found.",
@@ -393,7 +369,7 @@ impl Executor for SharedLibraryExecutor {
             // This occurs when --all-targets is specified
             eprintln!("Ignoring CompileMode::Test for target: {}", target.name());
         } else if mode == CompileMode::Build {
-            let mut new_args = cmd.get_args().to_owned();
+            let mut new_args = cmd.get_args().map(|v| v.clone()).collect::<Vec<OsString>>(); 
 
             //
             // Change crate-type from cdylib to rlib
@@ -442,27 +418,6 @@ fn list_needed_dylibs(readelf_path: &Path, library_path: &Path) -> CargoResult<H
             None
         })
         .collect())
-}
-
-/// List Android shared libraries
-fn list_android_dylibs(version_specific_libraries_path: &Path) -> CargoResult<HashSet<String>> {
-    fs::read_dir(version_specific_libraries_path)?
-        .filter_map(|entry| {
-            entry
-                .map(|entry| {
-                    if entry.path().is_file() {
-                        if let Some(file_name) = entry.file_name().to_str() {
-                            if file_name.ends_with(".so") {
-                                return Some(file_name.into());
-                            }
-                        }
-                    }
-                    None
-                })
-                .transpose()
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|err| err.into())
 }
 
 /// Get native library search paths from rustc args
@@ -522,9 +477,14 @@ string(REPLACE "--target={build_target}" "" CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}}")
 string(REPLACE "--target={build_target}" "" CMAKE_CXX_FLAGS "${{CMAKE_CXX_FLAGS}}")
 unset(CMAKE_C_COMPILER CACHE)
 unset(CMAKE_CXX_COMPILER CACHE)
-include("{ndk_path}/build/cmake/android.toolchain.cmake")"#,
+target_link_libraries(android
+                      dl
+                      log
+                      m
+                      c
+                      unwind)
+"#,
         min_sdk_version = config.min_sdk_version,
-        ndk_path = config.ndk_path.to_string_lossy().replace("\\", "/"), // Use forward slashes even on windows to avoid path escaping issues.
         build_target = build_target.rust_triple(),
         abi = build_target.android_abi(),
     )?;

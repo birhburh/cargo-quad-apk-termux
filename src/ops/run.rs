@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use crate::config::AndroidConfig;
 use crate::ops::install;
 use anyhow::format_err;
@@ -41,7 +42,10 @@ pub fn run(workspace: &Workspace, config: &AndroidConfig, options: &ArgMatches) 
     //
     // Start the APK using adb
     //
-    let adb = config.sdk_path.join("platform-tools/adb");
+    let adb = match which::which("adb") {
+        Ok(tool_path) => PathBuf::from(tool_path),
+        _ => return Err(format_err!("command not found: adb")),
+    };
 
     // Found it by doing this :
     //     adb shell "cmd package resolve-activity --brief com.author.myproject | tail -n 1"

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+use anyhow::format_err;
 use super::BuildResult;
 use crate::config::AndroidConfig;
 use crate::ops::build;
@@ -13,7 +15,10 @@ pub fn install(
 ) -> CargoResult<BuildResult> {
     let build_result = build::build(workspace, config, options)?;
 
-    let adb = config.sdk_path.join("platform-tools/adb");
+    let adb = match which::which("adb") {
+        Ok(tool_path) => PathBuf::from(tool_path),
+        _ => return Err(format_err!("command not found: adb")),
+    };
 
     for apk_path in build_result.target_to_apk_map.values() {
         drop(writeln!(
